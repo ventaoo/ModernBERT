@@ -38,6 +38,9 @@ except ImportError:
 # Import Flash Attention 2, which supports ALiBi https://github.com/Dao-AILab/flash-attention
 try:
     from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_qkvpacked_func  # type: ignore
+    # [新增]
+    from flash_attn import flash_attn_varlen_func
+    # [新增]
 
     installed_version = importlib.metadata.version("flash_attn")  # type: ignore
     if installed_version < "2.5.7":
