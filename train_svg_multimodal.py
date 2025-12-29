@@ -309,7 +309,9 @@ def main():
         
         # 训练任务
         masked_prediction=True,      # 只预测 mask 部分，加速
-        loss_function="fa_cross_entropy"
+        loss_function="fa_cross_entropy",
+
+        embedding_layer='sans_pos'
     )
     
     # 实例化模型
