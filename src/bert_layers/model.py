@@ -1043,7 +1043,7 @@ class FlexBertWithCLIP(FlexBertPreTrainedModel):
             param.requires_grad = False
             
         # 4. 初始化权重 (只针对 FlexBert 部分，CLIP 已经加载了预训练权重)
-        self.post_init()
+        self.bert.post_init() 
 
     def get_input_embeddings(self):
         return self.bert.get_input_embeddings()
