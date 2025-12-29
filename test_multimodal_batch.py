@@ -74,7 +74,9 @@ def main():
         cross_attention_layer="cross_unpad", # 指定使用我们写的 Cross Attention 类
         
         # CLIP 设置
-        vision_model_name="openai/clip-vit-base-patch32"
+        vision_model_name="openai/clip-vit-base-patch32",
+
+        embedding_layer="sans_pos"
     )
 
     # ==========================================
