@@ -1529,6 +1529,129 @@ class FlexBertPaddedParallelAttention(FlexBertAttentionBase):
         attn = attn.view(bs, seqlen, dim)
         return self.out_drop(self.Wo(attn))
 
+# [新增] Cross Attention implementation
+class FlexBertCrossAttention(FlexBertAttentionBase):
+    """
+    Performs cross-attention between unpadded text sequences (Query) and 
+    batched image features (Key/Value).
+    """
+
+    def __init__(self, config: FlexBertConfig, layer_id: Optional[int] = None):
+        super().__init__(config=config, layer_id=layer_id)
+        
+        # 基础参数检查
+        if config.hidden_size % config.num_attention_heads != 0:
+            raise ValueError(f"Hidden size {config.hidden_size} not divisible by {config.num_attention_heads}")
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attn_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attn_head_size
+        self.p_dropout = config.attention_probs_dropout_prob
+        
+        # 1. Q 投影 (来自文本)
+        self.Wq = nn.Linear(config.hidden_size, self.all_head_size, bias=config.attn_qkv_bias)
+        
+        # 2. KV 投影 (来自图片)
+        # 如果 vision_hidden_size 与 hidden_size 不同，Linear 会自动处理维度变换
+        vision_dim = config.vision_hidden_size if config.vision_hidden_size is not None else config.hidden_size
+        self.Wkv = nn.Linear(vision_dim, 2 * self.all_head_size, bias=config.attn_qkv_bias)
+        
+        # 3. 输出投影
+        self.Wo = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attn_out_bias)
+        self.out_drop = nn.Dropout(config.attn_out_dropout_prob) if config.attn_out_dropout_prob > 0.0 else nn.Identity()
+        
+        self.use_fa2 = config.use_fa2
+        
+        if not IMPL_USE_FLASH2 and self.use_fa2:
+            logger.warn_once("Flash Attention 2 not found, Cross Attention might fail or fall back to slow path.")
+            self.use_fa2 = False
+
+    def _init_weights(self, reset_params: bool = False):
+        # 初始化权重 (参考 FlexBertUnpadAttention)
+        init_weights(self.config, self.Wq, type_of_module=ModuleType.in_module)
+        init_weights(self.config, self.Wkv, type_of_module=ModuleType.in_module) # KV 需要单独初始化
+        init_weights(self.config, self.Wo, layer_id=self.layer_id, type_of_module=ModuleType.out_module)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,          # Text (Q): [Total_NNZ, Dim]
+        encoder_hidden_states: torch.Tensor,  # Image (KV): [Batch, Img_Seq, Vision_Dim]
+        cu_seqlens: torch.Tensor,             # Text 的累积长度
+        max_seqlen: int,                      # Text 的最大长度
+        # encoder_attention_mask: Optional[torch.Tensor] = None # 图片通常不需要 mask (定长)
+    ) -> torch.Tensor:
+        
+        batch_size = encoder_hidden_states.shape[0]
+        img_seq_len = encoder_hidden_states.shape[1]
+        
+        # --- 1. 计算 Query (Text) ---
+        # q: [Total_NNZ, Num_Heads * Head_Dim]
+        q = self.Wq(hidden_states)
+        # Reshape for FA2: [Total_NNZ, Num_Heads, Head_Dim]
+        q = q.view(-1, self.num_attention_heads, self.attn_head_size)
+
+        # --- 2. 计算 Key/Value (Image) ---
+        # kv: [Batch, Img_Seq, 2 * Num_Heads * Head_Dim]
+        kv = self.Wkv(encoder_hidden_states)
+        
+        # Flash Attention Varlen 接口要求 KV 也是压扁的 (Unpadded)
+        # 所以我们需要把 [Batch, Img_Seq, ...] 压扁成 [Batch * Img_Seq, ...]
+        # kv_flat: [Total_Img_Tokens, 2, Num_Heads, Head_Dim]
+        kv_flat = kv.view(-1, 2, self.num_attention_heads, self.attn_head_size)
+
+        # --- 3. 构造 Image 的 cu_seqlens ---
+        # 因为图片通常是定长的 (例如 CLIP 输出 257 个 token)，构造 cu_seqlens 很简单
+        # cu_seqlens_k: [0, 257, 514, ..., Total]
+        # 注意：这里假设所有图片的长度都一样。如果不一样，需要传入 encoder_attention_mask 来计算
+        if self.use_fa2:
+            # 构造 kv 的累积长度索引
+            # 必须在与 input 相同的 device 上
+            cu_seqlens_k = torch.arange(
+                0, (batch_size + 1) * img_seq_len, step=img_seq_len,
+                dtype=torch.int32, device=q.device
+            )
+            max_seqlen_k = img_seq_len
+
+            # --- 4. Flash Attention 计算 ---
+            # q: [Total_Text_NNZ, Heads, Dim]
+            # k, v: [Total_Img_NNZ, Heads, Dim]
+            # cu_seqlens_q: Text 索引
+            # cu_seqlens_k: Image 索引
+            
+            # 确保 dtype 兼容 (FA2 需要 fp16/bf16)
+            orig_dtype = q.dtype
+            if q.dtype not in (torch.float16, torch.bfloat16):
+                q = q.to(torch.bfloat16)
+                kv_flat = kv_flat.to(torch.bfloat16)
+
+            attn_output = flash_attn_varlen_func(
+                q,
+                kv_flat[:, 0], # K
+                kv_flat[:, 1], # V
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen_k,
+                dropout_p=self.p_dropout if self.training else 0.0,
+                softmax_scale=None, # 默认 1/sqrt(d)
+                causal=False # Cross Attention 不是 Causal 的
+            )
+            
+            attn_output = attn_output.to(orig_dtype)
+            
+            # Reshape 回 [Total_NNZ, Dim]
+            attn_output = attn_output.view(hidden_states.shape[0], self.config.hidden_size)
+            
+            return self.out_drop(self.Wo(attn_output))
+        
+        else:
+            # Fallback to SDPA (PyTorch Native)
+            # 这需要把 Text Q 还原回 Padded 形状 [Batch, Text_Seq, Heads, Dim]
+            # 这是一个性能较低的路径，但在开发调试阶段很有用
+            # (为了简洁，这里省略 SDPA 的具体实现，重点在 FA2)
+            raise NotImplementedError("SDPA fallback for Cross Attention not implemented yet.")
+
+# [新增] Cross Attention implementation
 
 ATTN2CLS = {
     "unpadded_base": FlexBertUnpadAttention,
@@ -1539,10 +1662,26 @@ ATTN2CLS = {
     "padded_rope": FlexBertPaddedRopeAttention,
     "unpadded_rope_parallel": FlexBertUnpadRopeParallelAttention,
     "padded_rope_parallel": FlexBertPaddedRopeParallelAttention,
+    # [新增] Cross Attention implementation
+    "cross_unpad": FlexBertCrossAttention,
+    # [新增] Cross Attention implementation
 }
 
 
-def get_attention_layer(config: FlexBertConfig, layer_id: Optional[int] = None) -> FlexBertAttentionBase:
+def get_attention_layer(config: FlexBertConfig, layer_id: Optional[int] = None, is_cross_attention: bool = False) -> FlexBertAttentionBase:
+    # [新增] 
+    if is_cross_attention:
+        # 获取配置中的 cross_attention_layer，默认为 "cross_unpad"
+        attn_layer_type = getattr(config, "cross_attention_layer", "cross_unpad")
+        try:
+            return ATTN2CLS[attn_layer_type](config, layer_id=layer_id)
+        except KeyError:
+            raise ValueError(
+                f"Invalid cross attention layer type: {attn_layer_type}. "
+                f"Must be one of {list(ATTN2CLS.keys())}."
+            )
+    # [新增] 
+        
     try:
         attention_layer = (
             config.initial_attention_layer

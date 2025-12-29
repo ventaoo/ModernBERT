@@ -51,6 +51,7 @@ import sys
 import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+from transformers import CLIPVisionModel
 
 # Add folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
@@ -949,6 +950,10 @@ class FlexBertModel(FlexBertPreTrainedModel):
         indices: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        # [新增] 接收 Cross Attention 的 Key/Value
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        # [新增] 接收 Cross Attention 的 Key/Value
         **kwargs,
     ) -> Tuple[Union[List[torch.Tensor], torch.Tensor], Optional[torch.Tensor]]:
         if attention_mask is None:
@@ -962,6 +967,10 @@ class FlexBertModel(FlexBertPreTrainedModel):
             indices=indices,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            # [新增] 透传给 FlexBertUnpadEncoder
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            # [新增] 透传给 FlexBertUnpadEncoder
         )
 
         if self.final_norm is not None:
@@ -997,6 +1006,103 @@ class FlexBertModel(FlexBertPreTrainedModel):
                 params -= _count_parameters(self.embeddings.position_embeddings, trainable)
         return params
 
+# [新增] FlexBertWithCLIP: A multimodal model combining FlexBERT and CLIP Vision Tower
+class FlexBertWithCLIP(FlexBertPreTrainedModel):
+    """
+    FlexBERT with a CLIP Vision Tower for multimodal tasks.
+    
+    The text encoder (FlexBert) uses unpadded Flash Attention, while the 
+    vision encoder (CLIP) processes batched images. They interact via 
+    Cross-Attention layers inside FlexBert.
+    """
+    
+    def __init__(self, config: FlexBertConfig):
+        super().__init__(config)
+        
+        # 1. 初始化文本主干 (FlexBertModel)
+        # 注意：此时 config.add_cross_attention 应该为 True
+        self.bert = FlexBertModel(config)
+        
+        # 2. 初始化视觉主干 (CLIP Vision Tower)
+        # 我们假设 config 中有一个字段指定了 CLIP 的版本，如果没有则使用默认值
+        vision_model_name = getattr(config, "vision_model_name", "openai/clip-vit-base-patch32")
+        
+        # 加载预训练的 CLIP Vision Model ⚠️ 这里会下载 HF 权重。
+        self.vision_encoder = CLIPVisionModel.from_pretrained(vision_model_name)
+        
+        # 校验维度一致性 (可选，但推荐)
+        if config.vision_hidden_size is not None:
+            if self.vision_encoder.config.hidden_size != config.vision_hidden_size:
+                raise ValueError(
+                    f"Configured vision_hidden_size ({config.vision_hidden_size}) does not match "
+                    f"CLIP model hidden size ({self.vision_encoder.config.hidden_size})."
+                )
+        
+        # 3. 冻结 CLIP 参数 (通常做法，防止破坏预训练的视觉特征)
+        for param in self.vision_encoder.parameters():
+            param.requires_grad = False
+            
+        # 4. 初始化权重 (只针对 FlexBert 部分，CLIP 已经加载了预训练权重)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.bert.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.bert.set_input_embeddings(value)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor, # [Batch, Channels, Height, Width]
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        # Unpadding 相关的元数据
+        indices: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        # 其他参数
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ):
+        # 1. 提取视觉特征
+        # 使用 no_grad 确保梯度不会回传到 CLIP (节省显存)
+        # 即使 requires_grad=False，no_grad 也能进一步减少中间激活值的存储
+        with torch.no_grad():
+            vision_outputs = self.vision_encoder(
+                pixel_values=pixel_values,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            # image_embeds: [Batch, Num_Patches + 1, Vision_Dim] (包含 CLS token)
+            # 如果不需要 CLS token，可以切片 vision_outputs.last_hidden_state[:, 1:, :]
+            # 但通常保留它作为全局特征补充
+            image_embeds = vision_outputs.last_hidden_state
+
+        # 2. 文本编码 + 跨模态融合
+        # image_embeds 将作为 Key/Value 传入 FlexBert
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            indices=indices,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            # [关键] 传入图片特征
+            encoder_hidden_states=image_embeds,
+            # 图片通常不需要 mask (定长)，除非做了 padding
+            encoder_attention_mask=None, 
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs
+        )
+
+        return outputs
+# [新增] FlexBertWithCLIP: A multimodal model combining FlexBERT and CLIP Vision Tower
 
 class FlexBertForMaskedLM(FlexBertPreTrainedModel):
     def __init__(self, config: FlexBertConfig):

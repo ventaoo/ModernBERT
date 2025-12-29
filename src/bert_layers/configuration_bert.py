@@ -97,6 +97,13 @@ class FlexBertConfig(TransformersBertConfig):
         pad_logits: bool = False,
         compile_model: bool = False,
         masked_prediction: bool = False,
+        
+        # [新增] Cross Attention 相关配置
+        add_cross_attention: bool = False,
+        cross_attention_frequency: int = 1, # 默认每层都加，或者你可以设为 2, 4 等
+        vision_hidden_size: int | None = None, # CLIP 视觉特征的维度，例如 768 或 1024
+        cross_attention_layer: str = "cross_unpad", # 指定 Cross Attention 的实现逻辑名
+        # [新增] Cross Attention 相关配置
         **kwargs,
     ):
         """
@@ -213,6 +220,13 @@ class FlexBertConfig(TransformersBertConfig):
         self.pad_logits = pad_logits
         self.compile_model = compile_model
         self.masked_prediction = masked_prediction
+
+        # [新增] 赋值给 self，这样 HF 才能自动保存到 config.json
+        self.add_cross_attention = add_cross_attention
+        self.cross_attention_frequency = cross_attention_frequency
+        self.vision_hidden_size = vision_hidden_size
+        self.cross_attention_layer = cross_attention_layer
+        # [新增] 赋值给 self，这样 HF 才能自动保存到 config.json
 
         if loss_kwargs.get("return_z_loss", False):
             if loss_function != "fa_cross_entropy":

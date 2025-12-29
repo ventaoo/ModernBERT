@@ -557,6 +557,101 @@ class FlexBertPaddedPostNormLayer(FlexBertLayerBase):
         attn_out = self.attn_norm(hidden_states + self.attn(hidden_states, attn_mask))
         return self.mlp_norm(attn_out + self.mlp(attn_out))
 
+# [新增] FlexBertUnpadCrossAttentionLayer 
+class FlexBertUnpadCrossAttentionLayer(FlexBertLayerBase):
+    """
+    Composes Self-Attention, Cross-Attention (to image encoder), and MLP blocks 
+    into a single layer using pre-normalization.
+    
+    Flow: Input -> Norm -> SelfAttn -> Add -> Norm -> CrossAttn -> Add -> Norm -> MLP -> Add
+    """
+
+    def __init__(self, config: FlexBertConfig, layer_id: Optional[int] = None):
+        super().__init__(config=config, layer_id=layer_id)
+        
+        # --- 1. Self Attention Block ---
+        if config.skip_first_prenorm and config.embed_norm and layer_id == 0:
+            self.attn_norm = nn.Identity()
+        else:
+            self.attn_norm = get_norm_layer(config)
+        self.attn = get_attention_layer(config, layer_id=layer_id)
+
+        # --- 2. Cross Attention Block ---
+        self.cross_attn_norm = get_norm_layer(config)
+        
+        # 从配置中获取 Cross Attention 的具体实现类名 (例如 "cross_unpad") 并实例化它。
+        self.cross_attn = get_attention_layer(
+            config, 
+            layer_id=layer_id, 
+            is_cross_attention=True
+        )
+
+        # --- 3. MLP Block ---
+        self.mlp_norm = get_norm_layer(config)
+        self.mlp = get_mlp_layer(config, layer_id=layer_id)
+
+    def _init_weights(self, reset_params: bool = False):
+        # 初始化 Self-Attn 和 MLP
+        super()._init_weights(reset_params)
+        
+        # 初始化 Cross-Attn 及其 Norm
+        self.cross_attn._init_weights(reset_params)
+        
+        if reset_params:
+            self.attn_norm.reset_parameters()
+            self.cross_attn_norm.reset_parameters()
+            self.mlp_norm.reset_parameters()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        indices: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        # 新增参数：接收图片特征
+        encoder_hidden_states: Optional[torch.Tensor] = None, 
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [Total_NNZ, Dim] (Text Q)
+            encoder_hidden_states: [Batch, Img_Seq, Vision_Dim] (Image KV)
+        """
+        
+        # 1. Self Attention
+        # x = x + SelfAttn(Norm(x))
+        self_attn_out = self.attn(
+            self.attn_norm(hidden_states), 
+            cu_seqlens, 
+            max_seqlen, 
+            indices, 
+            attn_mask
+        )
+        hidden_states = hidden_states + self_attn_out
+
+        # 2. Cross Attention
+        # x = x + CrossAttn(Norm(x), encoder_states)
+        # 只有当传入了 encoder_hidden_states 时才执行 (兼容纯文本预训练)
+        if encoder_hidden_states is not None:
+            # 注意：这里我们将 cu_seqlens 和 max_seqlen 透传给 Cross Attention
+            # 因为 Query (文本) 依然是 Unpadded 的结构
+            cross_attn_out = self.cross_attn(
+                hidden_states=self.cross_attn_norm(hidden_states),
+                encoder_hidden_states=encoder_hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen
+            )
+            hidden_states = hidden_states + cross_attn_out
+
+        # 3. MLP
+        # x = x + MLP(Norm(x))
+        mlp_out = self.mlp(self.mlp_norm(hidden_states))
+        hidden_states = hidden_states + mlp_out
+        
+        return hidden_states
+# [新增] FlexBertUnpadCrossAttentionLayer
+
 
 LAYER2CLS = {
     "unpadded_prenorm": FlexBertUnpadPreNormLayer,
@@ -566,6 +661,9 @@ LAYER2CLS = {
     "padded_prenorm": FlexBertPaddedPreNormLayer,
     "padded_parallel_prenorm": FlexBertPaddedParallelPreNormLayer,
     "padded_postnorm": FlexBertPaddedPostNormLayer,
+    # [新增] FlexBertUnpadCrossAttentionLayer
+    "unpadded_cross_prenorm": FlexBertUnpadCrossAttentionLayer, 
+    # [新增] FlexBertUnpadCrossAttentionLayer
 }
 
 
@@ -579,6 +677,25 @@ def get_bert_layer(config: FlexBertConfig, layer_id: Optional[int] = None) -> Fl
         bert_layer = maybe_add_padding(config, bert_layer)
         if config.compile_model and bert_layer == "unpadded_prenorm":
             bert_layer = "unpadded_compile_prenorm"
+
+
+        # [新增] Cross Attention 路由逻辑
+        """
+        检查是否开启全局开关，并且当前层是否满足频率要求
+        假设 frequency=2，则 layer 1, 3, 5... 会添加 cross attention (0-indexed)
+        或者 layer 0, 2, 4... 取决于具体需求，这里通常使用模运算
+            例如：每 freq 层加一个，从第 0 层开始加，或者从第 freq-1 层开始
+            这里实现为：如果 layer_id % freq == 0，则添加
+        """
+        if getattr(config, "add_cross_attention", False):
+            freq = getattr(config, "cross_attention_frequency", 1)
+            if layer_id is not None and layer_id % freq == 0:
+                if "unpadded" in bert_layer and "prenorm" in bert_layer:
+                    bert_layer = "unpadded_cross_prenorm"
+                else:
+                    raise ValueError("Cross Attention currently only supports 'unpadded' and 'prenorm' configuration.")
+        # [新增] Cross Attention 路由逻辑
+
         return LAYER2CLS[bert_layer](config, layer_id=layer_id)
     except KeyError:
         if layer_id < config.num_initial_layers and getattr(config, "initial_bert_layer", None) is not None:
@@ -632,6 +749,10 @@ class FlexBertUnpadEncoder(FlexBertEncoderBase):
         indices: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        # [新增参数] 接收 Cross Attention 所需的 Key/Value
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None, 
+        # [新增参数] 接收 Cross Attention 所需的 Key/Value
     ) -> torch.Tensor:
         if indices is None and cu_seqlens is None and max_seqlen is None:
             attention_mask_bool = attention_mask.bool()
@@ -647,6 +768,10 @@ class FlexBertUnpadEncoder(FlexBertEncoderBase):
                     max_seqlen,
                     indices,
                     attn_mask=attention_mask,
+                    # [新增参数] 透传图片特征
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask, 
+                    # [新增参数] 透传图片特征
                 )
 
             return bert_padding.pad_input(hidden_states, indices, batch, seqlen)
@@ -658,6 +783,10 @@ class FlexBertUnpadEncoder(FlexBertEncoderBase):
                     max_seqlen,
                     indices,
                     attn_mask=attention_mask,
+                    # [新增参数] 透传图片特征
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask, 
+                    # [新增参数] 透传图片特征
                 )
             return hidden_states
 
