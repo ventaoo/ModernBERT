@@ -152,7 +152,30 @@ class FlexBertWithCLIPForMaskedLM(FlexBertPreTrainedModel):
 class SVGRenderer:
     @staticmethod
     def clean_and_render(svg_content: str, target_size=224) -> Image.Image:
-        return Image.new("RGB", (target_size, target_size), (0, 0, 0))
+        try:
+            # 强制设置宽高为 100% 以适应画布，防止原始内容过小
+            # 1. 移除现有的 width/height 属性
+            svg_content = re.sub(r'(<svg[^>]*?)\s+width="[^"]*"', r'\1', svg_content, flags=re.IGNORECASE)
+            svg_content = re.sub(r'(<svg[^>]*?)\s+height="[^"]*"', r'\1', svg_content, flags=re.IGNORECASE)
+            
+            # 2. 添加 width="100%" height="100%"
+            if "<svg" in svg_content:
+                svg_content = svg_content.replace("<svg", '<svg width="100%" height="100%"', 1)
+            
+            # 3. 渲染为 PNG
+            png_bytes = cairosvg.svg2png(
+                bytestring=svg_content.encode('utf-8'),
+                output_width=target_size,
+                output_height=target_size,
+                unsafe=True # 允许加载外部资源(如果有的话)，注意安全风险，但在训练受控数据集时通常没问题
+            )
+            
+            image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            return image
+        except Exception as e:
+            print(f"Error rendering SVG: {e}")
+            # 返回全黑图片作为 fallback，避免训练中断
+            return Image.new("RGB", (target_size, target_size), (0, 0, 0))
 
 class MultimodalSVGDataset(Dataset):
     def __init__(self, hf_dataset, tokenizer, image_processor, max_length=512):
