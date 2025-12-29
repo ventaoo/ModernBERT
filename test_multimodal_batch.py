@@ -10,7 +10,6 @@ from transformers import AutoTokenizer, CLIPImageProcessor
 sys.path.append(os.path.join(os.getcwd(), "src"))
 
 from src.bert_layers.configuration_bert import FlexBertConfig
-# 假设你在 src/bert_layers/model.py 中实现了 FlexBertWithCLIP
 from src.bert_layers.model import FlexBertWithCLIP 
 
 def create_dummy_data(batch_size=2):
@@ -29,7 +28,6 @@ def create_dummy_data(batch_size=2):
     assert len(svg_texts) == batch_size
 
     # 2. 模拟对应的图片 (RGB)
-    # 真实场景中这是 SVG 渲染后的图片，这里用 PIL 生成随机图
     images = []
     for _ in range(batch_size):
         # CLIP 默认输入大概是 224x224，这里生成随机像素
@@ -40,12 +38,11 @@ def create_dummy_data(batch_size=2):
     return svg_texts, images
 
 def main():
-    # 检查环境
     if not torch.cuda.is_available():
         raise RuntimeError("This script requires a GPU (e.g., RTX 4090).")
     
     device = torch.device("cuda")
-    dtype = torch.bfloat16 # 4090 推荐使用 bf16
+    dtype = torch.bfloat16
     
     print(f"Running on {torch.cuda.get_device_name(0)} with {dtype}")
 
