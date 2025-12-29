@@ -350,6 +350,9 @@ class FlexBertUnpadPreNormLayer(FlexBertLayerBase):
         max_seqlen: int,
         indices: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        # [新增]
+        **kwargs,  # <--- [必须添加] 这里的 **kwargs 用于吞掉 encoder_hidden_states 等多余参数
+        # [新增]
     ) -> torch.Tensor:
         """Forward pass for a BERT layer, including both attention and MLP.
 
